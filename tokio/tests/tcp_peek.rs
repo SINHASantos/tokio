@@ -1,5 +1,6 @@
 #![warn(rust_2018_idioms)]
-#![cfg(all(feature = "full", not(tokio_wasi)))] // Wasi doesn't support bind
+#![cfg(all(feature = "full", not(target_os = "wasi"), not(miri)))] // Wasi doesn't support bind
+                                                                   // No `socket` on miri.
 
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -7,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio_test::assert_ok;
 
 use std::thread;
-use std::{convert::TryInto, io::Write, net};
+use std::{io::Write, net};
 
 #[tokio::test]
 async fn peek() {

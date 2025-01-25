@@ -5,7 +5,7 @@ mod level;
 pub(crate) use self::level::Expiration;
 use self::level::Level;
 
-use std::ptr::NonNull;
+use std::{array, ptr::NonNull};
 
 use super::EntryList;
 
@@ -35,7 +35,7 @@ pub(crate) struct Wheel {
     /// * ~ 4 min slots / ~ 4 hr range
     /// * ~ 4 hr slots / ~ 12 day range
     /// * ~ 12 day slots / ~ 2 yr range
-    levels: Vec<Level>,
+    levels: Box<[Level; NUM_LEVELS]>,
 
     /// Entries queued for firing
     pending: EntryList,
@@ -52,11 +52,9 @@ pub(super) const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
 impl Wheel {
     /// Creates a new timing wheel.
     pub(crate) fn new() -> Wheel {
-        let levels = (0..NUM_LEVELS).map(Level::new).collect();
-
         Wheel {
             elapsed: 0,
-            levels,
+            levels: Box::new(array::from_fn(Level::new)),
             pending: EntryList::new(),
         }
     }
@@ -130,7 +128,6 @@ impl Wheel {
                 );
 
                 let level = self.level_for(when);
-
                 self.levels[level].remove_entry(item);
             }
         }
@@ -148,23 +145,13 @@ impl Wheel {
                 return Some(handle);
             }
 
-            // under what circumstances is poll.expiration Some vs. None?
-            let expiration = self.next_expiration().and_then(|expiration| {
-                if expiration.deadline > now {
-                    None
-                } else {
-                    Some(expiration)
-                }
-            });
-
-            match expiration {
-                Some(ref expiration) if expiration.deadline > now => return None,
-                Some(ref expiration) => {
+            match self.next_expiration() {
+                Some(ref expiration) if expiration.deadline <= now => {
                     self.process_expiration(expiration);
 
                     self.set_elapsed(expiration.deadline);
                 }
-                None => {
+                _ => {
                     // in this case the poll did not indicate an expiration
                     // _and_ we were not able to find a next expiration in
                     // the current list of timers.  advance to the poll's
@@ -190,11 +177,11 @@ impl Wheel {
         }
 
         // Check all levels
-        for level in 0..NUM_LEVELS {
-            if let Some(expiration) = self.levels[level].next_expiration(self.elapsed) {
+        for (level_num, level) in self.levels.iter().enumerate() {
+            if let Some(expiration) = level.next_expiration(self.elapsed) {
                 // There cannot be any expirations at a higher level that happen
                 // before this one.
-                debug_assert!(self.no_expirations_before(level + 1, expiration.deadline));
+                debug_assert!(self.no_expirations_before(level_num + 1, expiration.deadline));
 
                 return Some(expiration);
             }
@@ -213,8 +200,8 @@ impl Wheel {
     fn no_expirations_before(&self, start_level: usize, before: u64) -> bool {
         let mut res = true;
 
-        for l2 in start_level..NUM_LEVELS {
-            if let Some(e2) = self.levels[l2].next_expiration(self.elapsed) {
+        for level in &self.levels[start_level..] {
+            if let Some(e2) = level.next_expiration(self.elapsed) {
                 if e2.deadline < before {
                     res = false;
                 }
@@ -277,7 +264,6 @@ impl Wheel {
     }
 
     /// Obtains the list of entries that need processing for the given expiration.
-    ///
     fn take_entries(&mut self, expiration: &Expiration) -> EntryList {
         self.levels[expiration.level].take_slot(expiration.slot)
     }
@@ -302,7 +288,7 @@ fn level_for(elapsed: u64, when: u64) -> usize {
     let leading_zeros = masked.leading_zeros() as usize;
     let significant = 63 - leading_zeros;
 
-    significant / 6
+    significant / NUM_LEVELS
 }
 
 #[cfg(all(test, not(loom)))]
@@ -312,13 +298,7 @@ mod test {
     #[test]
     fn test_level_for() {
         for pos in 0..64 {
-            assert_eq!(
-                0,
-                level_for(0, pos),
-                "level_for({}) -- binary = {:b}",
-                pos,
-                pos
-            );
+            assert_eq!(0, level_for(0, pos), "level_for({pos}) -- binary = {pos:b}");
         }
 
         for level in 1..5 {
@@ -327,9 +307,7 @@ mod test {
                 assert_eq!(
                     level,
                     level_for(0, a as u64),
-                    "level_for({}) -- binary = {:b}",
-                    a,
-                    a
+                    "level_for({a}) -- binary = {a:b}"
                 );
 
                 if pos > level {
@@ -337,9 +315,7 @@ mod test {
                     assert_eq!(
                         level,
                         level_for(0, a as u64),
-                        "level_for({}) -- binary = {:b}",
-                        a,
-                        a
+                        "level_for({a}) -- binary = {a:b}"
                     );
                 }
 
@@ -348,9 +324,7 @@ mod test {
                     assert_eq!(
                         level,
                         level_for(0, a as u64),
-                        "level_for({}) -- binary = {:b}",
-                        a,
-                        a
+                        "level_for({a}) -- binary = {a:b}"
                     );
                 }
             }

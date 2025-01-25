@@ -1,6 +1,6 @@
 cfg_not_wasi! {
-    use crate::future::poll_fn;
     use crate::net::{to_socket_addrs, ToSocketAddrs};
+    use std::future::poll_fn;
     use std::time::Duration;
 }
 
@@ -8,12 +8,11 @@ use crate::io::{AsyncRead, AsyncWrite, Interest, PollEvented, ReadBuf, Ready};
 use crate::net::tcp::split::{split, ReadHalf, WriteHalf};
 use crate::net::tcp::split_owned::{split_owned, OwnedReadHalf, OwnedWriteHalf};
 
-use std::convert::TryFrom;
 use std::fmt;
 use std::io;
 use std::net::{Shutdown, SocketAddr};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 cfg_io_util! {
     use bytes::BufMut;
@@ -214,6 +213,7 @@ impl TcpStream {
     /// # Examples
     ///
     /// ```
+    /// # if cfg!(miri) { return } // No `socket` in miri.
     /// use std::error::Error;
     /// use std::io::Read;
     /// use tokio::net::TcpListener;
@@ -223,10 +223,14 @@ impl TcpStream {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn Error>> {
     ///     let mut data = [0u8; 12];
+    /// #   if false {
     ///     let listener = TcpListener::bind("127.0.0.1:34254").await?;
-    /// #   let handle = tokio::spawn(async {
-    /// #       let mut stream: TcpStream = TcpStream::connect("127.0.0.1:34254").await.unwrap();
-    /// #       stream.write(b"Hello world!").await.unwrap();
+    /// #   }
+    /// #   let listener = TcpListener::bind("127.0.0.1:0").await?;
+    /// #   let addr = listener.local_addr().unwrap();
+    /// #   let handle = tokio::spawn(async move {
+    /// #       let mut stream: TcpStream = TcpStream::connect(addr).await.unwrap();
+    /// #       stream.write_all(b"Hello world!").await.unwrap();
     /// #   });
     ///     let (tokio_tcp_stream, _) = listener.accept().await?;
     ///     let mut std_tcp_stream = tokio_tcp_stream.into_std()?;
@@ -246,7 +250,7 @@ impl TcpStream {
             use std::os::unix::io::{FromRawFd, IntoRawFd};
             self.io
                 .into_inner()
-                .map(|io| io.into_raw_fd())
+                .map(IntoRawFd::into_raw_fd)
                 .map(|raw_fd| unsafe { std::net::TcpStream::from_raw_fd(raw_fd) })
         }
 
@@ -259,7 +263,7 @@ impl TcpStream {
                 .map(|raw_socket| unsafe { std::net::TcpStream::from_raw_socket(raw_socket) })
         }
 
-        #[cfg(tokio_wasi)]
+        #[cfg(target_os = "wasi")]
         {
             use std::os::wasi::io::{FromRawFd, IntoRawFd};
             self.io
@@ -337,7 +341,7 @@ impl TcpStream {
     /// use tokio::io::{self, ReadBuf};
     /// use tokio::net::TcpStream;
     ///
-    /// use futures::future::poll_fn;
+    /// use std::future::poll_fn;
     ///
     /// #[tokio::main]
     /// async fn main() -> io::Result<()> {
@@ -916,7 +920,7 @@ impl TcpStream {
     /// were written.
     ///
     /// Data is written from each buffer in order, with the final buffer read
-    /// from possible being only partially consumed. This method behaves
+    /// from possibly being only partially consumed. This method behaves
     /// equivalently to a single call to [`try_write()`] with concatenated
     /// buffers.
     ///
@@ -1016,12 +1020,48 @@ impl TcpStream {
             .try_io(interest, || self.io.try_io(f))
     }
 
+    /// Reads or writes from the socket using a user-provided IO operation.
+    ///
+    /// The readiness of the socket is awaited and when the socket is ready,
+    /// the provided closure is called. The closure should attempt to perform
+    /// IO operation on the socket by manually calling the appropriate syscall.
+    /// If the operation fails because the socket is not actually ready,
+    /// then the closure should return a `WouldBlock` error. In such case the
+    /// readiness flag is cleared and the socket readiness is awaited again.
+    /// This loop is repeated until the closure returns an `Ok` or an error
+    /// other than `WouldBlock`.
+    ///
+    /// The closure should only return a `WouldBlock` error if it has performed
+    /// an IO operation on the socket that failed due to the socket not being
+    /// ready. Returning a `WouldBlock` error in any other situation will
+    /// incorrectly clear the readiness flag, which can cause the socket to
+    /// behave incorrectly.
+    ///
+    /// The closure should not perform the IO operation using any of the methods
+    /// defined on the Tokio `TcpStream` type, as this will mess with the
+    /// readiness flag and can cause the socket to behave incorrectly.
+    ///
+    /// This method is not intended to be used with combined interests.
+    /// The closure should perform only one type of IO operation, so it should not
+    /// require more than one ready state. This method may panic or sleep forever
+    /// if it is called with a combined interest.
+    pub async fn async_io<R>(
+        &self,
+        interest: Interest,
+        mut f: impl FnMut() -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io
+            .registration()
+            .async_io(interest, || self.io.try_io(&mut f))
+            .await
+    }
+
     /// Receives data on the socket from the remote address to which it is
     /// connected, without removing that data from the queue. On success,
     /// returns the number of bytes peeked.
     ///
     /// Successive calls return the same data. This is accomplished by passing
-    /// `MSG_PEEK` as a flag to the underlying recv system call.
+    /// `MSG_PEEK` as a flag to the underlying `recv` system call.
     ///
     /// # Examples
     ///
@@ -1139,13 +1179,13 @@ impl TcpStream {
             socket2::SockRef::from(self).linger()
         }
 
-        /// Sets the linger duration of this socket by setting the SO_LINGER option.
+        /// Sets the linger duration of this socket by setting the `SO_LINGER` option.
         ///
         /// This option controls the action taken when a stream has unsent messages and the stream is
-        /// closed. If SO_LINGER is set, the system shall block the process until it can transmit the
+        /// closed. If `SO_LINGER` is set, the system shall block the process until it can transmit the
         /// data or until the time expires.
         ///
-        /// If SO_LINGER is not specified, and the stream is closed, the system handles the call in a
+        /// If `SO_LINGER` is not specified, and the stream is closed, the system handles the call in a
         /// way that allows the process to continue as quickly as possible.
         ///
         /// # Examples
@@ -1239,7 +1279,7 @@ impl TcpStream {
 
     // == Poll IO functions that takes `&self` ==
     //
-    // To read or write without mutable access to the `UnixStream`, combine the
+    // To read or write without mutable access to the `TcpStream`, combine the
     // `poll_read_ready` or `poll_write_ready` methods with the `try_read` or
     // `try_write` methods.
 
@@ -1342,21 +1382,31 @@ mod sys {
             self.io.as_raw_fd()
         }
     }
+
+    impl AsFd for TcpStream {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
+        }
+    }
 }
 
-#[cfg(windows)]
-mod sys {
-    use super::TcpStream;
-    use std::os::windows::prelude::*;
+cfg_windows! {
+    use crate::os::windows::io::{AsRawSocket, RawSocket, AsSocket, BorrowedSocket};
 
     impl AsRawSocket for TcpStream {
         fn as_raw_socket(&self) -> RawSocket {
             self.io.as_raw_socket()
         }
     }
+
+    impl AsSocket for TcpStream {
+        fn as_socket(&self) -> BorrowedSocket<'_> {
+            unsafe { BorrowedSocket::borrow_raw(self.as_raw_socket()) }
+        }
+    }
 }
 
-#[cfg(all(tokio_unstable, tokio_wasi))]
+#[cfg(all(tokio_unstable, target_os = "wasi"))]
 mod sys {
     use super::TcpStream;
     use std::os::wasi::prelude::*;
@@ -1364,6 +1414,12 @@ mod sys {
     impl AsRawFd for TcpStream {
         fn as_raw_fd(&self) -> RawFd {
             self.io.as_raw_fd()
+        }
+    }
+
+    impl AsFd for TcpStream {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
         }
     }
 }

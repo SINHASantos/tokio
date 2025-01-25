@@ -1,16 +1,21 @@
-use crate::future::poll_fn;
 use crate::io::{AsyncRead, AsyncWrite, Interest, PollEvented, ReadBuf, Ready};
 use crate::net::unix::split::{split, ReadHalf, WriteHalf};
 use crate::net::unix::split_owned::{split_owned, OwnedReadHalf, OwnedWriteHalf};
 use crate::net::unix::ucred::{self, UCred};
 use crate::net::unix::SocketAddr;
 
-use std::convert::TryFrom;
 use std::fmt;
+use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net;
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::net::{self, SocketAddr as StdSocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -33,12 +38,31 @@ cfg_net_unix! {
     ///
     /// [`shutdown()`]: fn@crate::io::AsyncWriteExt::shutdown
     /// [`UnixListener::accept`]: crate::net::UnixListener::accept
+    #[cfg_attr(docsrs, doc(alias = "uds"))]
     pub struct UnixStream {
         io: PollEvented<mio::net::UnixStream>,
     }
 }
 
 impl UnixStream {
+    pub(crate) async fn connect_mio(sys: mio::net::UnixStream) -> io::Result<UnixStream> {
+        let stream = UnixStream::new(sys)?;
+
+        // Once we've connected, wait for the stream to be writable as
+        // that's when the actual connection has been initiated. Once we're
+        // writable we check for `take_socket_error` to see if the connect
+        // actually hit an error or not.
+        //
+        // If all that succeeded then we ship everything on up.
+        poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
+
+        if let Some(e) = stream.io.take_error()? {
+            return Err(e);
+        }
+
+        Ok(stream)
+    }
+
     /// Connects to the socket named by `path`.
     ///
     /// This function will create a new Unix socket and connect to the path
@@ -48,7 +72,20 @@ impl UnixStream {
     where
         P: AsRef<Path>,
     {
-        let stream = mio::net::UnixStream::connect(path)?;
+        // On linux, abstract socket paths need to be considered.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let addr = {
+            let os_str_bytes = path.as_ref().as_os_str().as_bytes();
+            if os_str_bytes.starts_with(b"\0") {
+                StdSocketAddr::from_abstract_name(&os_str_bytes[1..])?
+            } else {
+                StdSocketAddr::from_pathname(path)?
+            }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let addr = StdSocketAddr::from_pathname(path)?;
+
+        let stream = mio::net::UnixStream::connect_addr(&addr)?;
         let stream = UnixStream::new(stream)?;
 
         poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
@@ -105,7 +142,7 @@ impl UnixStream {
     ///             // if the readiness event is a false positive.
     ///             match stream.try_read(&mut data) {
     ///                 Ok(n) => {
-    ///                     println!("read {} bytes", n);        
+    ///                     println!("read {} bytes", n);
     ///                 }
     ///                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
     ///                     continue;
@@ -706,9 +743,45 @@ impl UnixStream {
             .try_io(interest, || self.io.try_io(f))
     }
 
-    /// Creates new `UnixStream` from a `std::os::unix::net::UnixStream`.
+    /// Reads or writes from the socket using a user-provided IO operation.
     ///
-    /// This function is intended to be used to wrap a UnixStream from the
+    /// The readiness of the socket is awaited and when the socket is ready,
+    /// the provided closure is called. The closure should attempt to perform
+    /// IO operation on the socket by manually calling the appropriate syscall.
+    /// If the operation fails because the socket is not actually ready,
+    /// then the closure should return a `WouldBlock` error. In such case the
+    /// readiness flag is cleared and the socket readiness is awaited again.
+    /// This loop is repeated until the closure returns an `Ok` or an error
+    /// other than `WouldBlock`.
+    ///
+    /// The closure should only return a `WouldBlock` error if it has performed
+    /// an IO operation on the socket that failed due to the socket not being
+    /// ready. Returning a `WouldBlock` error in any other situation will
+    /// incorrectly clear the readiness flag, which can cause the socket to
+    /// behave incorrectly.
+    ///
+    /// The closure should not perform the IO operation using any of the methods
+    /// defined on the Tokio `UnixStream` type, as this will mess with the
+    /// readiness flag and can cause the socket to behave incorrectly.
+    ///
+    /// This method is not intended to be used with combined interests.
+    /// The closure should perform only one type of IO operation, so it should not
+    /// require more than one ready state. This method may panic or sleep forever
+    /// if it is called with a combined interest.
+    pub async fn async_io<R>(
+        &self,
+        interest: Interest,
+        mut f: impl FnMut() -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io
+            .registration()
+            .async_io(interest, || self.io.try_io(&mut f))
+            .await
+    }
+
+    /// Creates new [`UnixStream`] from a [`std::os::unix::net::UnixStream`].
+    ///
+    /// This function is intended to be used to wrap a `UnixStream` from the
     /// standard library in the Tokio equivalent.
     ///
     /// # Notes
@@ -760,6 +833,7 @@ impl UnixStream {
     /// # Examples
     ///
     /// ```
+    /// # if cfg!(miri) { return } // No `socket` in miri.
     /// use std::error::Error;
     /// use std::io::Read;
     /// use tokio::net::UnixListener;
@@ -792,7 +866,7 @@ impl UnixStream {
     pub fn into_std(self) -> io::Result<std::os::unix::net::UnixStream> {
         self.io
             .into_inner()
-            .map(|io| io.into_raw_fd())
+            .map(IntoRawFd::into_raw_fd)
             .map(|raw_fd| unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) })
     }
 
@@ -998,5 +1072,11 @@ impl fmt::Debug for UnixStream {
 impl AsRawFd for UnixStream {
     fn as_raw_fd(&self) -> RawFd {
         self.io.as_raw_fd()
+    }
+}
+
+impl AsFd for UnixStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
