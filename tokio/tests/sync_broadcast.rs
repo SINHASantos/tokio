@@ -2,7 +2,7 @@
 #![warn(rust_2018_idioms)]
 #![cfg(feature = "sync")]
 
-#[cfg(tokio_wasm_not_wasi)]
+#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
 use tokio::sync::broadcast;
@@ -52,9 +52,11 @@ macro_rules! assert_closed {
     };
 }
 
+#[allow(unused)]
 trait AssertSend: Send + Sync {}
 impl AssertSend for broadcast::Sender<i32> {}
 impl AssertSend for broadcast::Receiver<i32> {}
+impl AssertSend for broadcast::WeakSender<i32> {}
 
 #[test]
 fn send_try_recv_bounded() {
@@ -276,23 +278,21 @@ fn send_no_rx() {
 
 #[test]
 #[should_panic]
-#[cfg(not(tokio_wasm))] // wasm currently doesn't support unwinding
+#[cfg(not(target_family = "wasm"))] // wasm currently doesn't support unwinding
 fn zero_capacity() {
     broadcast::channel::<()>(0);
 }
 
 #[test]
 #[should_panic]
-#[cfg(not(tokio_wasm))] // wasm currently doesn't support unwinding
+#[cfg(not(target_family = "wasm"))] // wasm currently doesn't support unwinding
 fn capacity_too_big() {
-    use std::usize;
-
     broadcast::channel::<()>(1 + (usize::MAX >> 1));
 }
 
 #[test]
 #[cfg(panic = "unwind")]
-#[cfg(not(tokio_wasm))] // wasm currently doesn't support unwinding
+#[cfg(not(target_family = "wasm"))] // wasm currently doesn't support unwinding
 fn panic_in_clone() {
     use std::panic::{self, AssertUnwindSafe};
 
@@ -563,7 +563,7 @@ fn sender_len() {
 }
 
 #[test]
-#[cfg(not(tokio_wasm_not_wasi))]
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
 fn sender_len_random() {
     use rand::Rng;
 
@@ -586,4 +586,125 @@ fn sender_len_random() {
         let expected_len = usize::min(usize::max(rx1.len(), rx2.len()), 16);
         assert_eq!(tx.len(), expected_len);
     }
+}
+
+#[test]
+fn send_in_waker_drop() {
+    use futures::task::ArcWake;
+    use std::future::Future;
+    use std::task::Context;
+
+    struct SendOnDrop(broadcast::Sender<()>);
+
+    impl Drop for SendOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    impl ArcWake for SendOnDrop {
+        fn wake_by_ref(_arc_self: &Arc<Self>) {}
+    }
+
+    // Test if there is no deadlock when replacing the old waker.
+
+    let (tx, mut rx) = broadcast::channel(16);
+
+    let mut fut = Box::pin(async {
+        let _ = rx.recv().await;
+    });
+
+    // Store our special waker in the receiving future.
+    let waker = futures::task::waker(Arc::new(SendOnDrop(tx)));
+    let mut cx = Context::from_waker(&waker);
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    drop(waker);
+
+    // Second poll shouldn't deadlock.
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let _ = fut.as_mut().poll(&mut cx);
+
+    // Test if there is no deadlock when calling waker.wake().
+
+    let (tx, mut rx) = broadcast::channel(16);
+
+    let mut fut = Box::pin(async {
+        let _ = rx.recv().await;
+    });
+
+    // Store our special waker in the receiving future.
+    let waker = futures::task::waker(Arc::new(SendOnDrop(tx.clone())));
+    let mut cx = Context::from_waker(&waker);
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    drop(waker);
+
+    // Shouldn't deadlock.
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn receiver_recv_is_cooperative() {
+    let (tx, mut rx) = broadcast::channel(8);
+
+    tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                assert!(tx.send(()).is_ok());
+                assert!(rx.recv().await.is_ok());
+            }
+        } => {},
+        _ = tokio::task::yield_now() => {},
+    }
+}
+
+#[test]
+fn broadcast_sender_closed() {
+    let (tx, rx) = broadcast::channel::<()>(1);
+    let rx2 = tx.subscribe();
+
+    let mut task = task::spawn(tx.closed());
+    assert_pending!(task.poll());
+
+    drop(rx);
+    assert!(!task.is_woken());
+    assert_pending!(task.poll());
+
+    drop(rx2);
+    assert!(task.is_woken());
+    assert_ready!(task.poll());
+}
+
+#[test]
+fn broadcast_sender_closed_with_extra_subscribe() {
+    let (tx, rx) = broadcast::channel::<()>(1);
+    let rx2 = tx.subscribe();
+
+    let mut task = task::spawn(tx.closed());
+    assert_pending!(task.poll());
+
+    drop(rx);
+    assert!(!task.is_woken());
+    assert_pending!(task.poll());
+
+    drop(rx2);
+    assert!(task.is_woken());
+
+    let rx3 = tx.subscribe();
+    assert_pending!(task.poll());
+
+    drop(rx3);
+    assert!(task.is_woken());
+    assert_ready!(task.poll());
+
+    let mut task2 = task::spawn(tx.closed());
+    assert_ready!(task2.poll());
+
+    let rx4 = tx.subscribe();
+    let mut task3 = task::spawn(tx.closed());
+    assert_pending!(task3.poll());
+
+    drop(rx4);
+    assert!(task3.is_woken());
+    assert_ready!(task3.poll());
 }

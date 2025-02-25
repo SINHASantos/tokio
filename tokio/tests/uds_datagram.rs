@@ -2,11 +2,11 @@
 #![cfg(feature = "full")]
 #![cfg(unix)]
 
-use futures::future::poll_fn;
 use tokio::io::ReadBuf;
 use tokio::net::UnixDatagram;
 use tokio::try_join;
 
+use std::future::poll_fn;
 use std::io;
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ async fn echo_server(socket: UnixDatagram) -> io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn echo() -> io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let server_path = dir.path().join("server.sock");
@@ -45,6 +46,7 @@ async fn echo() -> io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn echo_from() -> io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let server_path = dir.path().join("server.sock");
@@ -71,6 +73,7 @@ async fn echo_from() -> io::Result<()> {
 
 // Even though we use sync non-blocking io we still need a reactor.
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No SOCK_DGRAM for `socketpair` in miri.
 async fn try_send_recv_never_block() -> io::Result<()> {
     let mut recv_buf = [0u8; 16];
     let payload = b"PAYLOAD";
@@ -87,7 +90,7 @@ async fn try_send_recv_never_block() -> io::Result<()> {
                 (io::ErrorKind::WouldBlock, _) => break,
                 (_, Some(libc::ENOBUFS)) => break,
                 _ => {
-                    panic!("unexpected error {:?}", err);
+                    panic!("unexpected error {err:?}");
                 }
             },
             Ok(len) => {
@@ -116,6 +119,7 @@ async fn try_send_recv_never_block() -> io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn split() -> std::io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("split.sock");
@@ -140,6 +144,7 @@ async fn split() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn send_to_recv_from_poll() -> std::io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let sender_path = dir.path().join("sender.sock");
@@ -161,6 +166,7 @@ async fn send_to_recv_from_poll() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn send_recv_poll() -> std::io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let sender_path = dir.path().join("sender.sock");
@@ -184,6 +190,7 @@ async fn send_recv_poll() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn try_send_to_recv_from() -> std::io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let server_path = dir.path().join("server.sock");
@@ -205,7 +212,7 @@ async fn try_send_to_recv_from() -> std::io::Result<()> {
                     break;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("{:?}", e),
+                Err(e) => panic!("{e:?}"),
             }
         }
 
@@ -222,7 +229,7 @@ async fn try_send_to_recv_from() -> std::io::Result<()> {
                     break;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("{:?}", e),
+                Err(e) => panic!("{e:?}"),
             }
         }
     }
@@ -231,6 +238,7 @@ async fn try_send_to_recv_from() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn try_recv_buf_from() -> std::io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let server_path = dir.path().join("server.sock");
@@ -252,7 +260,7 @@ async fn try_recv_buf_from() -> std::io::Result<()> {
                     break;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("{:?}", e),
+                Err(e) => panic!("{e:?}"),
             }
         }
 
@@ -269,7 +277,7 @@ async fn try_recv_buf_from() -> std::io::Result<()> {
                     break;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("{:?}", e),
+                Err(e) => panic!("{e:?}"),
             }
         }
     }
@@ -277,8 +285,32 @@ async fn try_recv_buf_from() -> std::io::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
+async fn recv_buf_from() -> std::io::Result<()> {
+    let tmp = tempfile::tempdir()?;
+
+    // Bind each socket to a filesystem path
+    let tx_path = tmp.path().join("tx");
+    let tx = UnixDatagram::bind(&tx_path)?;
+    let rx_path = tmp.path().join("rx");
+    let rx = UnixDatagram::bind(&rx_path)?;
+
+    let bytes = b"hello world";
+    tx.send_to(bytes, &rx_path).await?;
+
+    let mut buf = Vec::with_capacity(24);
+    let (size, addr) = rx.recv_buf_from(&mut buf).await?;
+
+    let dgram = &buf[..size];
+    assert_eq!(dgram, bytes);
+    assert_eq!(addr.as_pathname().unwrap(), &tx_path);
+    Ok(())
+}
+
 // Even though we use sync non-blocking io we still need a reactor.
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No SOCK_DGRAM for `socketpair` in miri.
 async fn try_recv_buf_never_block() -> io::Result<()> {
     let payload = b"PAYLOAD";
     let mut count = 0;
@@ -294,7 +326,7 @@ async fn try_recv_buf_never_block() -> io::Result<()> {
                 (io::ErrorKind::WouldBlock, _) => break,
                 (_, Some(libc::ENOBUFS)) => break,
                 _ => {
-                    panic!("unexpected error {:?}", err);
+                    panic!("unexpected error {err:?}");
                 }
             },
             Ok(len) => {
@@ -326,6 +358,26 @@ async fn try_recv_buf_never_block() -> io::Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // No SOCK_DGRAM for `socketpair` in miri.
+async fn recv_buf() -> std::io::Result<()> {
+    // Create the pair of sockets
+    let (sock1, sock2) = UnixDatagram::pair()?;
+
+    // Since the sockets are paired, the paired send/recv
+    // functions can be used
+    let bytes = b"hello world";
+    sock1.send(bytes).await?;
+
+    let mut buff = Vec::with_capacity(24);
+    let size = sock2.recv_buf(&mut buff).await?;
+
+    let dgram = &buff[..size];
+    assert_eq!(dgram, bytes);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
 async fn poll_ready() -> io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let server_path = dir.path().join("server.sock");
@@ -347,7 +399,7 @@ async fn poll_ready() -> io::Result<()> {
                     break;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("{:?}", e),
+                Err(e) => panic!("{e:?}"),
             }
         }
 
@@ -364,7 +416,7 @@ async fn poll_ready() -> io::Result<()> {
                     break;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("{:?}", e),
+                Err(e) => panic!("{e:?}"),
             }
         }
     }

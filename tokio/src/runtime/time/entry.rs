@@ -11,10 +11,10 @@
 //! 2) a held driver lock.
 //!
 //! It follows from this that any changes made while holding BOTH 1 and 2 will
-//! be reliably visible, regardless of ordering. This is because of the acq/rel
+//! be reliably visible, regardless of ordering. This is because of the `acq/rel`
 //! fences on the driver lock ensuring ordering with 2, and rust mutable
 //! reference rules for 1 (a mutable reference to an object can't be passed
-//! between threads without an acq/rel barrier, and same-thread we have local
+//! between threads without an `acq/rel` barrier, and same-thread we have local
 //! happens-before ordering).
 //!
 //! # State field
@@ -58,6 +58,7 @@ use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::atomic::AtomicU64;
 use crate::loom::sync::atomic::Ordering;
 
+use crate::runtime::context;
 use crate::runtime::scheduler;
 use crate::sync::AtomicWaker;
 use crate::time::Instant;
@@ -72,17 +73,21 @@ type TimerResult = Result<(), crate::time::error::Error>;
 const STATE_DEREGISTERED: u64 = u64::MAX;
 const STATE_PENDING_FIRE: u64 = STATE_DEREGISTERED - 1;
 const STATE_MIN_VALUE: u64 = STATE_PENDING_FIRE;
+/// The largest safe integer to use for ticks.
+///
+/// This value should be updated if any other signal values are added above.
+pub(super) const MAX_SAFE_MILLIS_DURATION: u64 = STATE_MIN_VALUE - 1;
 
 /// This structure holds the current shared state of the timer - its scheduled
 /// time (if registered), or otherwise the result of the timer completing, as
 /// well as the registered waker.
 ///
-/// Generally, the StateCell is only permitted to be accessed from two contexts:
-/// Either a thread holding the corresponding &mut TimerEntry, or a thread
-/// holding the timer driver lock. The write actions on the StateCell amount to
-/// passing "ownership" of the StateCell between these contexts; moving a timer
-/// from the TimerEntry to the driver requires _both_ holding the &mut
-/// TimerEntry and the driver lock, while moving it back (firing the timer)
+/// Generally, the `StateCell` is only permitted to be accessed from two contexts:
+/// Either a thread holding the corresponding `&mut TimerEntry`, or a thread
+/// holding the timer driver lock. The write actions on the `StateCell` amount to
+/// passing "ownership" of the `StateCell` between these contexts; moving a timer
+/// from the `TimerEntry` to the driver requires _both_ holding the `&mut
+/// TimerEntry` and the driver lock, while moving it back (firing the timer)
 /// requires only the driver lock.
 pub(super) struct StateCell {
     /// Holds either the scheduled expiration time for this timer, or (if the
@@ -94,7 +99,7 @@ pub(super) struct StateCell {
     /// without holding the driver lock is undefined behavior.
     result: UnsafeCell<TimerResult>,
     /// The currently-registered waker
-    waker: CachePadded<AtomicWaker>,
+    waker: AtomicWaker,
 }
 
 impl Default for StateCell {
@@ -114,7 +119,7 @@ impl StateCell {
         Self {
             state: AtomicU64::new(STATE_DEREGISTERED),
             result: UnsafeCell::new(Ok(())),
-            waker: CachePadded(AtomicWaker::new()),
+            waker: AtomicWaker::new(),
         }
     }
 
@@ -126,7 +131,7 @@ impl StateCell {
     fn when(&self) -> Option<u64> {
         let cur_state = self.state.load(Ordering::Relaxed);
 
-        if cur_state == u64::MAX {
+        if cur_state == STATE_DEREGISTERED {
             None
         } else {
             Some(cur_state)
@@ -139,7 +144,7 @@ impl StateCell {
         // We must register first. This ensures that either `fire` will
         // observe the new waker, or we will observe a racing fire to have set
         // the state, or both.
-        self.waker.0.register_by_ref(waker);
+        self.waker.register_by_ref(waker);
 
         self.read_state()
     }
@@ -160,7 +165,7 @@ impl StateCell {
     /// Marks this timer as being moved to the pending list, if its scheduled
     /// time is not after `not_after`.
     ///
-    /// If the timer is scheduled for a time after not_after, returns an Err
+    /// If the timer is scheduled for a time after `not_after`, returns an Err
     /// containing the current scheduled time.
     ///
     /// SAFETY: Must hold the driver lock.
@@ -183,18 +188,14 @@ impl StateCell {
                 break Err(cur_state);
             }
 
-            match self.state.compare_exchange(
+            match self.state.compare_exchange_weak(
                 cur_state,
                 STATE_PENDING_FIRE,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    break Ok(());
-                }
-                Err(actual_state) => {
-                    cur_state = actual_state;
-                }
+                Ok(_) => break Ok(()),
+                Err(actual_state) => cur_state = actual_state,
             }
         }
     }
@@ -202,7 +203,7 @@ impl StateCell {
     /// Fires the timer, setting the result to the provided result.
     ///
     /// Returns:
-    /// * `Some(waker) - if fired and a waker needs to be invoked once the
+    /// * `Some(waker)` - if fired and a waker needs to be invoked once the
     ///   driver lock is released
     /// * `None` - if fired and a waker does not need to be invoked, or if
     ///   already fired
@@ -227,7 +228,7 @@ impl StateCell {
 
         self.state.store(STATE_DEREGISTERED, Ordering::Release);
 
-        self.waker.0.take_waker()
+        self.waker.take_waker()
     }
 
     /// Marks the timer as registered (poll will return None) and sets the
@@ -262,12 +263,8 @@ impl StateCell {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    return Ok(());
-                }
-                Err(true_prior) => {
-                    prior = true_prior;
-                }
+                Ok(_) => return Ok(()),
+                Err(true_prior) => prior = true_prior,
             }
         }
     }
@@ -297,7 +294,7 @@ pub(crate) struct TimerEntry {
     ///
     /// This is manipulated only under the inner mutex. TODO: Can we use loom
     /// cells for this?
-    inner: StdUnsafeCell<TimerShared>,
+    inner: StdUnsafeCell<Option<TimerShared>>,
     /// Deadline for the timer. This is used to register on the first
     /// poll, as we can't register prior to being pinned.
     deadline: Instant,
@@ -310,15 +307,15 @@ pub(crate) struct TimerEntry {
 unsafe impl Send for TimerEntry {}
 unsafe impl Sync for TimerEntry {}
 
-/// An TimerHandle is the (non-enforced) "unique" pointer from the driver to the
-/// timer entry. Generally, at most one TimerHandle exists for a timer at a time
+/// An `TimerHandle` is the (non-enforced) "unique" pointer from the driver to the
+/// timer entry. Generally, at most one `TimerHandle` exists for a timer at a time
 /// (enforced by the timer state machine).
 ///
-/// SAFETY: An TimerHandle is essentially a raw pointer, and the usual caveats
-/// of pointer safety apply. In particular, TimerHandle does not itself enforce
-/// that the timer does still exist; however, normally an TimerHandle is created
+/// SAFETY: An `TimerHandle` is essentially a raw pointer, and the usual caveats
+/// of pointer safety apply. In particular, `TimerHandle` does not itself enforce
+/// that the timer does still exist; however, normally an `TimerHandle` is created
 /// immediately before registering the timer, and is consumed when firing the
-/// timer, to help minimize mistakes. Still, because TimerHandle cannot enforce
+/// timer, to help minimize mistakes. Still, because `TimerHandle` cannot enforce
 /// memory safety, all operations are unsafe.
 #[derive(Debug)]
 pub(crate) struct TimerHandle {
@@ -331,11 +328,19 @@ pub(super) type EntryList = crate::util::linked_list::LinkedList<TimerShared, Ti
 /// frontend (`Entry`) and driver backend.
 ///
 /// Note that this structure is located inside the `TimerEntry` structure.
-#[derive(Debug)]
-#[repr(C)]
 pub(crate) struct TimerShared {
-    /// Data manipulated by the driver thread itself, only.
-    driver_state: CachePadded<TimerSharedPadded>,
+    /// The shard id. We should never change it.
+    shard_id: u32,
+    /// A link within the doubly-linked list of timers on a particular level and
+    /// slot. Valid only if state is equal to Registered.
+    ///
+    /// Only accessed under the entry lock.
+    pointers: linked_list::Pointers<TimerShared>,
+
+    /// The expiration time for which this entry is currently registered.
+    /// Generally owned by the driver, but is accessed by the entry when not
+    /// registered.
+    cached_when: AtomicU64,
 
     /// Current state. This records whether the timer entry is currently under
     /// the ownership of the driver, and if not, its current state (not
@@ -345,19 +350,33 @@ pub(crate) struct TimerShared {
     _p: PhantomPinned,
 }
 
+unsafe impl Send for TimerShared {}
+unsafe impl Sync for TimerShared {}
+
+impl std::fmt::Debug for TimerShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimerShared")
+            .field("cached_when", &self.cached_when.load(Ordering::Relaxed))
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 generate_addr_of_methods! {
     impl<> TimerShared {
         unsafe fn addr_of_pointers(self: NonNull<Self>) -> NonNull<linked_list::Pointers<TimerShared>> {
-            &self.driver_state.0.pointers
+            &self.pointers
         }
     }
 }
 
 impl TimerShared {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(shard_id: u32) -> Self {
         Self {
+            shard_id,
+            cached_when: AtomicU64::new(0),
+            pointers: linked_list::Pointers::new(),
             state: StateCell::default(),
-            driver_state: CachePadded(TimerSharedPadded::new()),
             _p: PhantomPinned,
         }
     }
@@ -365,7 +384,7 @@ impl TimerShared {
     /// Gets the cached time-of-expiration value.
     pub(super) fn cached_when(&self) -> u64 {
         // Cached-when is only accessed under the driver lock, so we can use relaxed
-        self.driver_state.0.cached_when.load(Ordering::Relaxed)
+        self.cached_when.load(Ordering::Relaxed)
     }
 
     /// Gets the true time-of-expiration value, and copies it into the cached
@@ -376,10 +395,7 @@ impl TimerShared {
     pub(super) unsafe fn sync_when(&self) -> u64 {
         let true_when = self.true_when();
 
-        self.driver_state
-            .0
-            .cached_when
-            .store(true_when, Ordering::Relaxed);
+        self.cached_when.store(true_when, Ordering::Relaxed);
 
         true_when
     }
@@ -389,10 +405,7 @@ impl TimerShared {
     /// SAFETY: Must be called with the driver lock held, and when this entry is
     /// not in any timer wheel lists.
     unsafe fn set_cached_when(&self, when: u64) {
-        self.driver_state
-            .0
-            .cached_when
-            .store(when, Ordering::Relaxed);
+        self.cached_when.store(when, Ordering::Relaxed);
     }
 
     /// Returns the true time-of-expiration value, with relaxed memory ordering.
@@ -407,7 +420,7 @@ impl TimerShared {
     /// in the timer wheel.
     pub(super) unsafe fn set_expiration(&self, t: u64) {
         self.state.set_expiration(t);
-        self.driver_state.0.cached_when.store(t, Ordering::Relaxed);
+        self.cached_when.store(t, Ordering::Relaxed);
     }
 
     /// Sets the true time-of-expiration only if it is after the current.
@@ -415,7 +428,7 @@ impl TimerShared {
         self.state.extend_expiration(t)
     }
 
-    /// Returns a TimerHandle for this timer.
+    /// Returns a `TimerHandle` for this timer.
     pub(super) fn handle(&self) -> TimerHandle {
         TimerHandle {
             inner: NonNull::from(self),
@@ -429,49 +442,12 @@ impl TimerShared {
     pub(super) fn might_be_registered(&self) -> bool {
         self.state.might_be_registered()
     }
-}
 
-/// Additional shared state between the driver and the timer which is cache
-/// padded. This contains the information that the driver thread accesses most
-/// frequently to minimize contention. In particular, we move it away from the
-/// waker, as the waker is updated on every poll.
-struct TimerSharedPadded {
-    /// A link within the doubly-linked list of timers on a particular level and
-    /// slot. Valid only if state is equal to Registered.
-    ///
-    /// Only accessed under the entry lock.
-    pointers: linked_list::Pointers<TimerShared>,
-
-    /// The expiration time for which this entry is currently registered.
-    /// Generally owned by the driver, but is accessed by the entry when not
-    /// registered.
-    cached_when: AtomicU64,
-
-    /// The true expiration time. Set by the timer future, read by the driver.
-    true_when: AtomicU64,
-}
-
-impl std::fmt::Debug for TimerSharedPadded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TimerSharedPadded")
-            .field("when", &self.true_when.load(Ordering::Relaxed))
-            .field("cached_when", &self.cached_when.load(Ordering::Relaxed))
-            .finish()
+    /// Gets the shard id.
+    pub(super) fn shard_id(&self) -> u32 {
+        self.shard_id
     }
 }
-
-impl TimerSharedPadded {
-    fn new() -> Self {
-        Self {
-            cached_when: AtomicU64::new(0),
-            true_when: AtomicU64::new(0),
-            pointers: linked_list::Pointers::new(),
-        }
-    }
-}
-
-unsafe impl Send for TimerShared {}
-unsafe impl Sync for TimerShared {}
 
 unsafe impl linked_list::Link for TimerShared {
     type Handle = TimerHandle;
@@ -497,23 +473,34 @@ unsafe impl linked_list::Link for TimerShared {
 
 impl TimerEntry {
     #[track_caller]
-    pub(crate) fn new(handle: &scheduler::Handle, deadline: Instant) -> Self {
+    pub(crate) fn new(handle: scheduler::Handle, deadline: Instant) -> Self {
         // Panic if the time driver is not enabled
         let _ = handle.driver().time();
 
-        let driver = handle.clone();
-
         Self {
-            driver,
-            inner: StdUnsafeCell::new(TimerShared::new()),
+            driver: handle,
+            inner: StdUnsafeCell::new(None),
             deadline,
             registered: false,
             _m: std::marker::PhantomPinned,
         }
     }
 
+    fn is_inner_init(&self) -> bool {
+        unsafe { &*self.inner.get() }.is_some()
+    }
+
+    // This lazy initialization is for performance purposes.
     fn inner(&self) -> &TimerShared {
-        unsafe { &*self.inner.get() }
+        let inner = unsafe { &*self.inner.get() };
+        if inner.is_none() {
+            let shard_size = self.driver.driver().time().inner.get_shard_size();
+            let shard_id = generate_shard_id(shard_size);
+            unsafe {
+                *self.inner.get() = Some(TimerShared::new(shard_id));
+            }
+        }
+        return inner.as_ref().unwrap();
     }
 
     pub(crate) fn deadline(&self) -> Instant {
@@ -521,11 +508,15 @@ impl TimerEntry {
     }
 
     pub(crate) fn is_elapsed(&self) -> bool {
-        !self.inner().state.might_be_registered() && self.registered
+        self.is_inner_init() && !self.inner().state.might_be_registered() && self.registered
     }
 
     /// Cancels and deregisters the timer. This operation is irreversible.
     pub(crate) fn cancel(self: Pin<&mut Self>) {
+        // Avoid calling the `clear_entry` method, because it has not been initialized yet.
+        if !self.is_inner_init() {
+            return;
+        }
         // We need to perform an acq/rel fence with the driver thread, and the
         // simplest way to do so is to grab the driver lock.
         //
@@ -551,9 +542,10 @@ impl TimerEntry {
         unsafe { self.driver().clear_entry(NonNull::from(self.inner())) };
     }
 
-    pub(crate) fn reset(mut self: Pin<&mut Self>, new_time: Instant) {
-        unsafe { self.as_mut().get_unchecked_mut() }.deadline = new_time;
-        unsafe { self.as_mut().get_unchecked_mut() }.registered = true;
+    pub(crate) fn reset(mut self: Pin<&mut Self>, new_time: Instant, reregister: bool) {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        this.deadline = new_time;
+        this.registered = reregister;
 
         let tick = self.driver().time_source().deadline_to_tick(new_time);
 
@@ -561,9 +553,11 @@ impl TimerEntry {
             return;
         }
 
-        unsafe {
-            self.driver()
-                .reregister(&self.driver.driver().io, tick, self.inner().into());
+        if reregister {
+            unsafe {
+                self.driver()
+                    .reregister(&self.driver.driver().io, tick, self.inner().into());
+            }
         }
     }
 
@@ -571,18 +565,18 @@ impl TimerEntry {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), super::Error>> {
-        if self.driver().is_shutdown() {
-            panic!("{}", crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR);
-        }
+        assert!(
+            !self.driver().is_shutdown(),
+            "{}",
+            crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR
+        );
 
         if !self.registered {
             let deadline = self.deadline;
-            self.as_mut().reset(deadline);
+            self.as_mut().reset(deadline, true);
         }
 
-        let this = unsafe { self.get_unchecked_mut() };
-
-        this.inner().state.poll(cx.waker())
+        self.inner().state.poll(cx.waker())
     }
 
     pub(crate) fn driver(&self) -> &super::Handle {
@@ -657,77 +651,28 @@ impl TimerHandle {
 
 impl Drop for TimerEntry {
     fn drop(&mut self) {
-        unsafe { Pin::new_unchecked(self) }.as_mut().cancel()
+        unsafe { Pin::new_unchecked(self) }.as_mut().cancel();
     }
 }
 
-// Copied from [crossbeam/cache_padded](https://github.com/crossbeam-rs/crossbeam/blob/fa35346b7c789bba045ad789e894c68c466d1779/crossbeam-utils/src/cache_padded.rs#L62-L127)
-//
-// Starting from Intel's Sandy Bridge, spatial prefetcher is now pulling pairs of 64-byte cache
-// lines at a time, so we have to align to 128 bytes rather than 64.
-//
-// Sources:
-// - https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-optimization-manual.pdf
-// - https://github.com/facebook/folly/blob/1b5288e6eea6df074758f877c849b6e73bbb9fbb/folly/lang/Align.h#L107
-//
-// ARM's big.LITTLE architecture has asymmetric cores and "big" cores have 128-byte cache line size.
-//
-// Sources:
-// - https://www.mono-project.com/news/2016/09/12/arm64-icache/
-//
-// powerpc64 has 128-byte cache line size.
-//
-// Sources:
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_ppc64x.go#L9
-#[cfg_attr(
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-    ),
-    repr(align(128))
-)]
-// arm, mips, mips64, and riscv64 have 32-byte cache line size.
-//
-// Sources:
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_arm.go#L7
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_mips.go#L7
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_mipsle.go#L7
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_mips64x.go#L9
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_riscv64.go#L7
-#[cfg_attr(
-    any(
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "riscv64",
-    ),
-    repr(align(32))
-)]
-// s390x has 256-byte cache line size.
-//
-// Sources:
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_s390x.go#L7
-#[cfg_attr(target_arch = "s390x", repr(align(256)))]
-// x86 and wasm have 64-byte cache line size.
-//
-// Sources:
-// - https://github.com/golang/go/blob/dda2991c2ea0c5914714469c4defc2562a907230/src/internal/cpu/cpu_x86.go#L9
-// - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_wasm.go#L7
-//
-// All others are assumed to have 64-byte cache line size.
-#[cfg_attr(
-    not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "riscv64",
-        target_arch = "s390x",
-    )),
-    repr(align(64))
-)]
-#[derive(Debug, Default)]
-struct CachePadded<T>(T);
+// Generates a shard id. If current thread is a worker thread, we use its worker index as a shard id.
+// Otherwise, we use a random number generator to obtain the shard id.
+cfg_rt! {
+    fn generate_shard_id(shard_size: u32) -> u32 {
+        let id = context::with_scheduler(|ctx| match ctx {
+            Some(scheduler::Context::CurrentThread(_ctx)) => 0,
+            #[cfg(feature = "rt-multi-thread")]
+            Some(scheduler::Context::MultiThread(ctx)) => ctx.get_worker_index() as u32,
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            Some(scheduler::Context::MultiThreadAlt(ctx)) => ctx.get_worker_index() as u32,
+            None => context::thread_rng_n(shard_size),
+        });
+        id % shard_size
+    }
+}
+
+cfg_not_rt! {
+    fn generate_shard_id(shard_size: u32) -> u32 {
+        context::thread_rng_n(shard_size)
+    }
+}

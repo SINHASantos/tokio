@@ -5,7 +5,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{ready, Context, Poll, Waker};
 
 cfg_rt! {
     /// An owned permission to join on a task (await its termination).
@@ -58,7 +58,7 @@ cfg_rt! {
     /// ```
     ///
     /// The generic parameter `T` in `JoinHandle<T>` is the return type of the spawned task.
-    /// If the return value is an i32, the join handle has type `JoinHandle<i32>`:
+    /// If the return value is an `i32`, the join handle has type `JoinHandle<i32>`:
     ///
     /// ```
     /// use tokio::task;
@@ -179,33 +179,44 @@ impl<T> JoinHandle<T> {
     /// already completed at the time it was cancelled, but most likely it
     /// will fail with a [cancelled] `JoinError`.
     ///
+    /// Be aware that tasks spawned using [`spawn_blocking`] cannot be aborted
+    /// because they are not async. If you call `abort` on a `spawn_blocking`
+    /// task, then this *will not have any effect*, and the task will continue
+    /// running normally. The exception is if the task has not started running
+    /// yet; in that case, calling `abort` may prevent the task from starting.
+    ///
+    /// See also [the module level docs] for more information on cancellation.
+    ///
     /// ```rust
     /// use tokio::time;
     ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///    let mut handles = Vec::new();
+    /// # #[tokio::main(flavor = "current_thread", start_paused = true)]
+    /// # async fn main() {
+    /// let mut handles = Vec::new();
     ///
-    ///    handles.push(tokio::spawn(async {
-    ///       time::sleep(time::Duration::from_secs(10)).await;
-    ///       true
-    ///    }));
+    /// handles.push(tokio::spawn(async {
+    ///    time::sleep(time::Duration::from_secs(10)).await;
+    ///    true
+    /// }));
     ///
-    ///    handles.push(tokio::spawn(async {
-    ///       time::sleep(time::Duration::from_secs(10)).await;
-    ///       false
-    ///    }));
+    /// handles.push(tokio::spawn(async {
+    ///    time::sleep(time::Duration::from_secs(10)).await;
+    ///    false
+    /// }));
     ///
-    ///    for handle in &handles {
-    ///        handle.abort();
-    ///    }
-    ///
-    ///    for handle in handles {
-    ///        assert!(handle.await.unwrap_err().is_cancelled());
-    ///    }
+    /// for handle in &handles {
+    ///     handle.abort();
     /// }
+    ///
+    /// for handle in handles {
+    ///     assert!(handle.await.unwrap_err().is_cancelled());
+    /// }
+    /// # }
     /// ```
+    ///
     /// [cancelled]: method@super::error::JoinError::is_cancelled
+    /// [the module level docs]: crate::task#cancellation
+    /// [`spawn_blocking`]: crate::task::spawn_blocking
     pub fn abort(&self) {
         self.raw.remote_abort();
     }
@@ -220,9 +231,8 @@ impl<T> JoinHandle<T> {
     /// ```rust
     /// use tokio::time;
     ///
-    /// # #[tokio::main(flavor = "current_thread")]
+    /// # #[tokio::main(flavor = "current_thread", start_paused = true)]
     /// # async fn main() {
-    /// # time::pause();
     /// let handle1 = tokio::spawn(async {
     ///     // do some stuff here
     /// });
@@ -252,7 +262,42 @@ impl<T> JoinHandle<T> {
     }
 
     /// Returns a new `AbortHandle` that can be used to remotely abort this task.
-    pub(crate) fn abort_handle(&self) -> super::AbortHandle {
+    ///
+    /// Awaiting a task cancelled by the `AbortHandle` might complete as usual if the task was
+    /// already completed at the time it was cancelled, but most likely it
+    /// will fail with a [cancelled] `JoinError`.
+    ///
+    /// ```rust
+    /// use tokio::{time, task};
+    ///
+    /// # #[tokio::main(flavor = "current_thread", start_paused = true)]
+    /// # async fn main() {
+    /// let mut handles = Vec::new();
+    ///
+    /// handles.push(tokio::spawn(async {
+    ///    time::sleep(time::Duration::from_secs(10)).await;
+    ///    true
+    /// }));
+    ///
+    /// handles.push(tokio::spawn(async {
+    ///    time::sleep(time::Duration::from_secs(10)).await;
+    ///    false
+    /// }));
+    ///
+    /// let abort_handles: Vec<task::AbortHandle> = handles.iter().map(|h| h.abort_handle()).collect();
+    ///
+    /// for handle in abort_handles {
+    ///     handle.abort();
+    /// }
+    ///
+    /// for handle in handles {
+    ///     assert!(handle.await.unwrap_err().is_cancelled());
+    /// }
+    /// # }
+    /// ```
+    /// [cancelled]: method@super::error::JoinError::is_cancelled
+    #[must_use = "abort handles do nothing unless `.abort` is called"]
+    pub fn abort_handle(&self) -> super::AbortHandle {
         self.raw.ref_inc();
         super::AbortHandle::new(self.raw)
     }
@@ -260,14 +305,7 @@ impl<T> JoinHandle<T> {
     /// Returns a [task ID] that uniquely identifies this task relative to other
     /// currently spawned tasks.
     ///
-    /// **Note**: This is an [unstable API][unstable]. The public API of this type
-    /// may break in 1.x releases. See [the documentation on unstable
-    /// features][unstable] for details.
-    ///
     /// [task ID]: crate::task::Id
-    /// [unstable]: crate#unstable-features
-    #[cfg(tokio_unstable)]
-    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
     pub fn id(&self) -> super::Id {
         // Safety: The header pointer is valid.
         unsafe { Header::get_id(self.raw.header_ptr()) }
@@ -280,10 +318,11 @@ impl<T> Future for JoinHandle<T> {
     type Output = super::Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        ready!(crate::trace::trace_leaf(cx));
         let mut ret = Poll::Pending;
 
         // Keep track of task budget
-        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
+        let coop = ready!(crate::task::coop::poll_proceed(cx));
 
         // Try to read the task output. If the task is not yet complete, the
         // waker is stored and is notified once the task does complete.
